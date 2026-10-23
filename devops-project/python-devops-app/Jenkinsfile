@@ -9,7 +9,14 @@ pipeline {
 
     environment {
         SONAR_HOST_URL = 'http://localhost:9000'
-        DOCKER_IMAGE = 'localhost:8083/python-devops-app'
+
+        NEXUS_REGISTRY = 'localhost:8083'
+        NEXUS_IMAGE = 'localhost:8083/python-devops-app'
+
+        AWS_REGION = 'ap-southeast-2'
+        ECR_REGISTRY = '401106839558.dkr.ecr.ap-southeast-2.amazonaws.com'
+        ECR_IMAGE = '401106839558.dkr.ecr.ap-southeast-2.amazonaws.com/python-devops-app'
+
         DOCKER_TAG = '1.0'
     }
 
@@ -79,7 +86,7 @@ pipeline {
                     sh '''
                         set -eu
                         docker build \
-                            -t "$DOCKER_IMAGE:$DOCKER_TAG" .
+                            -t "$NEXUS_IMAGE:$DOCKER_TAG" .
                     '''
                 }
             }
@@ -99,25 +106,63 @@ pipeline {
                         set -eu
 
                         printf '%s' "$NEXUS_PASSWORD" |
-                            docker login localhost:8083 \
+                            docker login "$NEXUS_REGISTRY" \
                                 --username "$NEXUS_USER" \
                                 --password-stdin
 
-                        docker push "$DOCKER_IMAGE:$DOCKER_TAG"
+                        docker push "$NEXUS_IMAGE:$DOCKER_TAG"
 
-                        docker logout localhost:8083
+                        docker logout "$NEXUS_REGISTRY"
                     '''
                 }
+            }
+        }
+
+        stage('Login to Amazon ECR') {
+            steps {
+                sh '''
+                    set -eu
+
+                    aws ecr get-login-password \
+                        --region "$AWS_REGION" |
+                        docker login "$ECR_REGISTRY" \
+                            --username AWS \
+                            --password-stdin
+                '''
+            }
+        }
+
+        stage('Tag Image for ECR') {
+            steps {
+                sh '''
+                    set -eu
+
+                    docker tag \
+                        "$NEXUS_IMAGE:$DOCKER_TAG" \
+                        "$ECR_IMAGE:$DOCKER_TAG"
+                '''
+            }
+        }
+
+        stage('Push Image to Amazon ECR') {
+            steps {
+                sh '''
+                    set -eu
+                    docker push "$ECR_IMAGE:$DOCKER_TAG"
+                '''
             }
         }
     }
 
     post {
         success {
-            echo 'Pipeline completed successfully.'
+            echo 'Pipeline successful: tests, SonarQube, Docker build, Nexus push and Amazon ECR push.'
         }
         failure {
-            echo 'Pipeline failed. Check the Jenkins console output.'
+            echo 'Pipeline failed. Check Console Output for the failed stage.'
+        }
+        always {
+            sh 'docker logout "$ECR_REGISTRY" || true'
         }
     }
 }
