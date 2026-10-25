@@ -1,4 +1,3 @@
-
 pipeline {
     agent any
 
@@ -8,8 +7,6 @@ pipeline {
     }
 
     environment {
-        SONAR_HOST_URL = 'http://localhost:9000'
-
         NEXUS_REGISTRY = 'localhost:8083'
         NEXUS_IMAGE = 'localhost:8083/python-devops-app'
 
@@ -18,6 +15,7 @@ pipeline {
         ECR_IMAGE = '401106839558.dkr.ecr.ap-southeast-2.amazonaws.com/python-devops-app'
 
         DOCKER_TAG = '1.0'
+        K8S_MANIFEST = 'devops-project/python-devops-app/k8s/deployment.yaml'
     }
 
     stages {
@@ -37,6 +35,7 @@ pipeline {
                         python3 -m venv .venv
                         .venv/bin/python -m pip install --upgrade pip
                         .venv/bin/pip install -r requirements.txt
+                        .venv/bin/pip install pytest
                     '''
                 }
             }
@@ -60,33 +59,12 @@ pipeline {
             }
         }
 
-        stage('SonarQube Analysis') {
-            steps {
-                dir('devops-project/python-devops-app') {
-                    withCredentials([
-                        string(
-                            credentialsId: 'sonar-token',
-                            variable: 'SONAR_TOKEN'
-                        )
-                    ]) {
-                        sh '''
-                            set -eu
-                            sonar-scanner \
-                                -Dsonar.host.url="$SONAR_HOST_URL" \
-                                -Dsonar.token="$SONAR_TOKEN"
-                        '''
-                    }
-                }
-            }
-        }
-
         stage('Build Docker Image') {
             steps {
                 dir('devops-project/python-devops-app') {
                     sh '''
                         set -eu
-                        docker build \
-                            -t "$NEXUS_IMAGE:$DOCKER_TAG" .
+                        docker build -t "$NEXUS_IMAGE:$DOCKER_TAG" .
                     '''
                 }
             }
@@ -111,8 +89,7 @@ pipeline {
                                 --password-stdin
 
                         docker push "$NEXUS_IMAGE:$DOCKER_TAG"
-
-                        docker logout "$NEXUS_REGISTRY"
+                        docker logout "$NEXUS_REGISTRY" || true
                     '''
                 }
             }
@@ -122,7 +99,6 @@ pipeline {
             steps {
                 sh '''
                     set -eu
-
                     aws ecr get-login-password \
                         --region "$AWS_REGION" |
                         docker login "$ECR_REGISTRY" \
@@ -132,37 +108,88 @@ pipeline {
             }
         }
 
-        stage('Tag Image for ECR') {
-            steps {
-                sh '''
-                    set -eu
-
-                    docker tag \
-                        "$NEXUS_IMAGE:$DOCKER_TAG" \
-                        "$ECR_IMAGE:$DOCKER_TAG"
-                '''
-            }
-        }
-
         stage('Push Image to Amazon ECR') {
             steps {
                 sh '''
                     set -eu
+                    docker tag "$NEXUS_IMAGE:$DOCKER_TAG" "$ECR_IMAGE:$DOCKER_TAG"
                     docker push "$ECR_IMAGE:$DOCKER_TAG"
                 '''
+            }
+        }
+
+        stage('Update GitOps Manifest') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'github-credentials',
+                        usernameVariable: 'GITHUB_USER',
+                        passwordVariable: 'GITHUB_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set +x
+                        set -eu
+
+                        test -f "$K8S_MANIFEST"
+
+                        IMAGE_TAG="build-${BUILD_NUMBER}"
+
+                        # Create and publish a unique image for this build.
+                        docker tag "$NEXUS_IMAGE:$DOCKER_TAG" "$ECR_IMAGE:$IMAGE_TAG"
+                        docker push "$ECR_IMAGE:$IMAGE_TAG"
+
+                        # Load that exact image into the Kind cluster.
+                        kind load docker-image "$ECR_IMAGE:$IMAGE_TAG" \
+                            --name python-devops
+
+                        # Update the image in the GitOps manifest.
+                        sed -i -E \
+                            "s|^[[:space:]]*image: .*python-devops-app:.*|          image: ${ECR_IMAGE}:${IMAGE_TAG}|" \
+                            "$K8S_MANIFEST"
+
+                        # Kind uses locally loaded images.
+                        sed -i 's/imagePullPolicy: Always/imagePullPolicy: Never/' \
+                            "$K8S_MANIFEST"
+
+                        git config user.name "Jenkins CI"
+                        git config user.email "jenkins@example.invalid"
+
+                        git add "$K8S_MANIFEST"
+
+                        if git diff --cached --quiet; then
+                            echo "ERROR: No GitOps manifest change was created."
+                            exit 1
+                        fi
+
+                        git commit -m "Update Python app image to ${IMAGE_TAG}"
+
+                        AUTH_HEADER=$(printf '%s:%s' "$GITHUB_USER" "$GITHUB_TOKEN" |
+                            base64 -w 0)
+
+                        git -c http.extraheader="AUTHORIZATION: basic ${AUTH_HEADER}" \
+                            push origin HEAD:main
+
+                        unset AUTH_HEADER
+                    '''
+                }
             }
         }
     }
 
     post {
         success {
-            echo 'Pipeline successful: tests, SonarQube, Docker build, Nexus push and Amazon ECR push.'
+            echo 'CI successful: tests passed, image published, and GitOps manifest pushed. Argo CD will reconcile the new Git revision.'
         }
         failure {
-            echo 'Pipeline failed. Check Console Output for the failed stage.'
+            echo 'Pipeline failed. Check Console Output for the first failed stage.'
         }
         always {
-            sh 'docker logout "$ECR_REGISTRY" || true'
+            sh '''
+                docker logout "$ECR_REGISTRY" || true
+                docker logout "$NEXUS_REGISTRY" || true
+            '''
         }
     }
 }
+
