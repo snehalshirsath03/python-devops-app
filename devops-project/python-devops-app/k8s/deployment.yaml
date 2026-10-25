@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
         - name: python-devops-web
-          image: python-devops-app:1.0
+          image: 401106839558.dkr.ecr.ap-southeast-2.amazonaws.com/python-devops-app:build-5
           imagePullPolicy: Never
           ports:
             - containerPort: 5000
